@@ -1,0 +1,7 @@
+NCBI Archaea Assembly 更新报告
+生成时间: 2025-12-05_11-13-58
+--------------------------------------------------
+新增 Assembly: 1 个
+  [+] GCF_002287175.1 (Methanobacterium bryantii)
+
+移除 Assembly: 0 个
