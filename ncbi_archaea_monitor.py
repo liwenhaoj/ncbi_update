@@ -1,19 +1,30 @@
 import os
 import requests
-import csv
 import datetime
 import shutil
 from pathlib import Path
+import logging
+import polars as pl
 
+log_level = os.getenv("LOG_LEVEL", "INFO")  # 默认 INFO
+logging.basicConfig(
+    level=log_level,   # 可以是 DEBUG/INFO/WARNING/ERROR
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+database = "refseq"
+type  = "archaea"
+out_directory = "out"
 # 配置
 # 这里使用 RefSeq 的古菌数据，如果需要 GenBank 数据，可以将链接中的 refseq 改为 genbank
-URL = "https://ftp.ncbi.nlm.nih.gov/genomes/refseq/archaea/assembly_summary.txt"
+URL = f"https://ftp.ncbi.nlm.nih.gov/genomes/{database}/{type}/assembly_summary.txt"
 # URL = "https://ftp.ncbi.nlm.nih.gov/genomes/genbank/archaea/assembly_summary.txt"
 
-DATA_DIR = Path("data")
-LATEST_FILE = DATA_DIR / "latest_assembly_summary.txt"
-PREVIOUS_FILE = DATA_DIR / "previous_assembly_summary.txt"
-HISTORY_DIR = DATA_DIR / "history"
+DATA_DIR = os.path.join(out_directory, f"{database}_{type}")
+LATEST_FILE = os.path.join(DATA_DIR, "latest_assembly_summary.txt")
+PREVIOUS_FILE = os.path.join(DATA_DIR, "previous_assembly_summary.txt")
+HISTORY_DIR = os.path.join(DATA_DIR, "history")
 
 def setup_directories():
     """创建必要的数据目录"""
@@ -23,79 +34,52 @@ def setup_directories():
         HISTORY_DIR.mkdir()
 
 def download_file(url, local_path):
-    """下载文件"""
-    print(f"正在下载: {url} ...")
+    f"""下载{database} {type} 数据"""
+    logging.info(f"正在下载: {url} ...")
     try:
         response = requests.get(url, stream=True)
         response.raise_for_status()
         with open(local_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
-        print(f"下载完成: {local_path}")
+        logging.info(f"{database} {type} 数据下载完成: {local_path}")
         return True
     except Exception as e:
-        print(f"下载失败: {e}")
+        logging.error(f"下载失败: {e}")
         return False
 
-def parse_summary_file(file_path):
-    """
-    解析 assembly_summary.txt 文件
-    返回一个字典，Key 为 assembly_accession, Value 为该行的详细信息(字典)
-    """
-    data = {}
-    if not file_path.exists():
-        return data
+def parse_summary_file(old_file_path, new_file_path):
+    df_old = pl.read_csv(old_file_path, separator="\t", skip_rows=1)
+    df_new = pl.read_csv(new_file_path, separator="\t", skip_rows=1)
 
-    with open(file_path, 'r', encoding='utf-8') as f:
-        # 跳过前面的注释行，找到 header
-        while True:
-            pos = f.tell()
-            line = f.readline()
-            if not line:
-                break
-            if line.startswith('#'):
-                # 检查是否是 header 行 (通常以 # assembly_accession 开头，或者类似)
-                # NCBI 的 header 行通常是第二行注释，或者以 # assembly_accession 开头
-                # 但是标准的 csv reader 处理带 # 的 header 可能需要手动处理
-                # 我们这里简单的策略：如果是 # assembly_accession... 则去掉 # 作为 header
-                if 'assembly_accession' in line:
-                    header_line = line.strip().lstrip('# ').split('\t')
-                    break
-            else:
-                # 如果没有找到 header 就遇到了数据，可能文件格式不对，或者回退
-                f.seek(pos)
-                break
-        
-        reader = csv.DictReader(f, fieldnames=header_line, delimiter='\t')
-        
-        for row in reader:
-            if not row['assembly_accession']:
-                continue
-            data[row['assembly_accession']] = row
-            
-    return data
+    # 提取两个文件的accession集合
+    accession_old = set(df_old["assembly_accession"].to_list())
+    accession_new = set(df_new["assembly_accession"].to_list())
 
-def compare_data(old_data, new_data):
-    """比较新旧数据"""
-    old_keys = set(old_data.keys())
-    new_keys = set(new_data.keys())
-
-    added = new_keys - old_keys
-    removed = old_keys - new_keys
+    # 计算增减
+    added_accessions = accession_new - accession_old  # 新增的accession
+    removed_accessions = accession_old - accession_new  # 删除的accession
     
-    # 检查版本更新 (accession 相同但其他字段变了的情况较少见，通常版本更新会有新的 accession version)
-    # 但是 NCBI 有时会更新同一 accession 的某些元数据
-    # 这里我们主要关注 accession 的增减
-    
-    return added, removed
+    data_old = {
+        row["assembly_accession"]: row
+        for row in df_old.to_dicts()  # to_dicts() 直接返回每行的字典列表
+    }
+
+    # 方式2（更简洁）：Polars 0.20+ 支持按行转字典后构建
+    data_new = {
+        row["assembly_accession"]: row
+        for row in df_new_clean.to_dicts()  # to_dicts() 直接返回每行的字典列表
+    }
+
+    return added_accessions, removed_accessions, data_old, data_new
 
 def generate_report(added, removed, new_data, old_data):
     """生成简单的报告"""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    report_file = HISTORY_DIR / f"update_report_{timestamp}.txt"
+    report_file = HISTORY_DIR / f"{database}_{type}_update_report_{timestamp}.txt"
     
     with open(report_file, 'w', encoding='utf-8') as f:
-        f.write(f"NCBI Archaea Assembly 更新报告\n")
+        f.write(f"NCBI {database} {type} Assembly 更新报告\n")
         f.write(f"生成时间: {timestamp}\n")
         f.write(f"--------------------------------------------------\n")
         
@@ -105,23 +89,23 @@ def generate_report(added, removed, new_data, old_data):
             f.write(f"新增 Assembly: {len(added)} 个\n")
             for acc in added:
                 info = new_data[acc]
-                f.write(f"  [+] {acc} ({info.get('organism_name', 'Unknown')})\n")
+                f.write(f"  [+] {acc} ({info.get('organism_name', 'Unknown')} | taxid: {info.get('taxid', 'Unknown')})\n")
             
             f.write(f"\n移除 Assembly: {len(removed)} 个\n")
             for acc in removed:
                 # 旧数据里可能有 info
                 info = old_data.get(acc, {})
-                f.write(f"  [-] {acc} ({info.get('organism_name', 'Unknown')})\n")
+                f.write(f"  [-] {acc} ({info.get('organism_name', 'Unknown')} | taxid: {info.get('taxid', 'Unknown')})\n")
     
-    print(f"报告已生成: {report_file}")
+    logging.info(f"{database} {type} 报告已生成: {report_file}")
     
     # 打印到控制台
     if added:
-        print(f"发现 {len(added)} 个新增记录。")
+        logging.debug(f"发现 {len(added)} 个新增记录。")
     if removed:
-        print(f"发现 {len(removed)} 个移除记录。")
+        logging.debug(f"发现 {len(removed)} 个移除记录。")
     if not added and not removed:
-        print("未发现变动。")
+        logging.debug("未发现变动。")
 
 def main():
     setup_directories()
@@ -133,7 +117,7 @@ def main():
     # - 如果 previous 存在，则与 previous 比较
     # - 如果 previous 不存在，但 latest 存在，则将 latest 视为 previous 并比较（或者提示这是第一次基准）
     
-    temp_file = DATA_DIR / "temp_assembly_summary.txt"
+    temp_file = os.path.join(DATA_DIR, "temp_assembly_summary.txt")
     
     if not download_file(URL, temp_file):
         print("下载失败，程序终止。")
@@ -141,21 +125,10 @@ def main():
 
     # 加载新数据
     print("解析新下载的数据...")
-    new_data = parse_summary_file(temp_file)
-    
-    # 尝试加载旧数据
-    old_data = {}
-    if LATEST_FILE.exists():
-        print(f"加载上次数据: {LATEST_FILE} ...")
-        old_data = parse_summary_file(LATEST_FILE)
-    else:
-        print("未找到上次的数据文件，此次将作为基准数据。")
-
-    # 比较
-    added, removed = compare_data(old_data, new_data)
+    added_accessions, removed_accessions, data_old, data_new = parse_summary_file(PREVIOUS_FILE, temp_file)
     
     # 生成报告
-    generate_report(added, removed, new_data, old_data)
+    generate_report(added_accessions, removed_accessions, data_new, data_old)
     
     # 更新文件
     # 将 temp 文件移动为 latest
@@ -169,11 +142,10 @@ def main():
     if LATEST_FILE.exists():
         # 备份一下旧的 latest 到 history，方便追溯
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = HISTORY_DIR / f"assembly_summary_{timestamp}.txt"
+        backup_path = os.path.join(HISTORY_DIR, f"assembly_summary_{timestamp}.txt")
         shutil.copy2(LATEST_FILE, backup_path)
-    
     shutil.move(temp_file, LATEST_FILE)
-    print(f"已更新基准数据: {LATEST_FILE}")
+    logging.info(f"已更新基准数据: {LATEST_FILE}")
 
 if __name__ == "__main__":
     main()
